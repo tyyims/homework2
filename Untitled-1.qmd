@@ -1,0 +1,302 @@
+---
+title: "Homework 2"
+author: "Taeyoung Yim"
+format:
+  pdf:
+    output-file: "yim-t-hwk2-1"
+    output-ext:  "pdf"
+    header-includes:
+      - \usepackage{float}
+      - \floatplacement{table}{H}
+---
+```{r}
+#| include: false
+# load packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, ggplot2, dplyr, lubridate, readr, readxl, hrbrthemes, fixest,
+               scales, gganimate, gapminder, gifski, png, tufte, plotly, OECD,
+               ggrepel, survey, foreign, devtools, pdftools, kableExtra, modelsummary,
+               kableExtra)
+```
+```{r}
+# bind two files
+final.hcris.v1996=read_rds('data/output/HCRIS_Data_v1996.rds')
+final.hcris.v2010=read_rds('data/output/HCRIS_Data_v2010.rds')
+
+final.hcris <- bind_rows(final.hcris.v1996, final.hcris.v2010)
+write.csv(final.hcris, "final.hcris.csv", row.names = FALSE)
+```
+```{r}
+#variable names
+variable_names <- names(final.hcris)
+print(variable_names)
+
+# Using colnames() function (works the same as names())
+variable_names <- colnames(final.hcris)
+print(variable_names)
+```
+\newpage
+# Summarize the Data
+\vspace{.2in}
+\noindent 1. How many hospitals filed more than one report in the same year? Show your answer as a line graph of the number of hospitals over time.?<br>
+```{r, echo = FALSE}
+library(dplyr)
+library(ggplot2)
+
+final.hcris.v1996 = final.hcris.v1996 %>%
+  mutate(hvbp_payment=NA, hrrp_payment=NA)
+
+## combine v1996 and v2010 hcris forms, and sort by provider_number/year
+final.hcris=rbind(final.hcris.v1996,final.hcris.v2010) %>%
+  mutate(fy_end=mdy(fy_end),fy_start=mdy(fy_start),
+         date_processed=mdy(date_processed),date_created=mdy(date_created),
+         tot_discounts=abs(tot_discounts), hrrp_payment=abs(hrrp_payment)) %>%
+  mutate(fyear=year(fy_end)) %>%
+  arrange(provider_number,fyear) %>%
+  dplyr::select(-year)
+
+## count of hospitals/provider_number by year
+final.hcris %>% group_by(fyear) %>% count()
+
+## graphing
+hospital_counts <- final.hcris %>% 
+  group_by(fyear) %>% 
+  count()
+hospital_counts <- hospital_counts %>%
+  filter(fyear >= 2008 & fyear <= 2016)
+ggplot(hospital_counts, aes(x = fyear, y = n)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = seq(2008, 2016, by = 1)) + 
+  labs(x = "Year", y = "Number of Hospitals", title = "Count of Hospitals/Provider Numbers by Year (2008-2016)")
+```
+
+\newpage
+\noindent 2. After removing/combining multiple reports, how many unique hospital IDs (Medicare provider numbers) exist in the data? <br>
+```{r, echo = FALSE}
+library(dplyr)
+
+filtered_data <- final.hcris %>%
+  filter(fyear >= 2008 & fyear <= 2016)
+
+unique_hospital_count <- filtered_data %>%
+  distinct(provider_number) %>%
+  nrow()
+
+print(unique_hospital_count)
+```
+
+\newpage
+\noindent 3. What is the distribution of total charges (tot_charges in the data) in each year? Show your results with a “violin” plot, with charges on the y-axis and years on the x-axis. For a nice tutorial on violin plots, look at Violin Plots with ggplot2.<br>
+```{r, echo = FALSE} 
+library(dplyr)
+library(ggplot2)
+
+# Filter the data for the years 2008 through 2016
+filtered_data <- final.hcris %>%
+  filter(fyear >= 2008 & fyear <= 2016)
+
+# Create a violin plot
+ggplot(filtered_data, aes(x = as.factor(fyear), y = tot_charges)) +
+  geom_violin(aes(group = cut_width(fyear,1)), scale = "width") +
+  labs(x = "Year", y = "Total Charges", title = "Distribution of Total Charges by Year (2008-2016)")
+```
+
+\newpage
+\noindent 4. What is the distribution of estimated prices in each year? Again present your results with a violin plot, and recall our formula for estimating prices from class. Be sure to do something about outliers and/or negative prices in the data. <br>
+
+```{r}
+estimated_prices <- function(ip_charges, icu_charges, ancillary_charges, tot_discounts, tot_charges, tot_mcare_payment, tot_discharges, mcare_discharges) {
+  # Calculate discount factor
+  discount_factor <- 1 - tot_discounts / tot_charges
+  
+  # Calculate numerator and denominator of price
+  price_num <- (ip_charges + icu_charges + ancillary_charges) * discount_factor - tot_mcare_payment
+  price_denom <- tot_discharges - mcare_discharges
+  
+  # Calculate price
+  estimated_price <- price_num / price_denom
+  
+  return(estimated_price)
+}
+
+# Calculate estimated prices
+final.hcris <- final.hcris %>%
+  mutate(estimated_price = calculate_estimated_price(ip_charges, icu_charges, ancillary_charges, tot_discounts, tot_charges, tot_mcare_payment, tot_discharges, mcare_discharges))
+
+filtered_data <- final.hcris %>%
+  filter(fyear >= 2008 & fyear <= 2016)
+
+# Handle outliers and negative prices
+# For example, you can remove negative prices
+filtered_data <- filtered_data %>%
+  filter(estimated_price >= 0, estimated_price<100000)
+
+# Create a violin plot
+ggplot(filtered_data, aes(x = as.factor(fyear), y = estimated_price)) +
+  geom_violin() +
+  labs(x = "Year", y = "Estimated Prices", title = "Distribution of Estimated Prices by Year (2008-2016)")
+```
+
+# Estimate ATEs
+\newpage
+\noindent 5. Calculate the average price among penalized versus non-penalized hospitals.<br>
+```{r, echo = FALSE}
+library(dplyr)
+
+data_2012 <- final.hcris %>%
+  filter(fyear == 2012)
+
+# Define penalized hospitals (1 if penalized, 0 if not)
+data_2012 <- data_2012 %>%
+  mutate(penalized = ifelse(hrrp_payment + hvbp_payment < 0, 1, 0))
+
+# Calculate the estimated price among penalized hospitals
+avg_price_penalized <- data_2012 %>%
+  filter(penalized == 1) %>%
+  summarise(avg_price_penalized = mean(calculate_estimated_price(ip_charges, icu_charges, ancillary_charges, tot_discounts, tot_charges, tot_mcare_payment, tot_discharges, mcare_discharges), na.rm = TRUE))
+
+# Calculate the estimated price among non-penalized hospitals
+avg_price_non_penalized <- data_2012 %>%
+  filter(penalized == 0) %>%
+  summarise(avg_price_non_penalized = mean(calculate_estimated_price(ip_charges, icu_charges, ancillary_charges, tot_discounts, tot_charges, tot_mcare_payment, tot_discharges, mcare_discharges), na.rm = TRUE))
+
+# Print the results
+print(avg_price_penalized)
+print(avg_price_non_penalized)
+```
+
+\newpage
+\noindent 6. Split hospitals into quartiles based on bed size. To do this, create 4 new indicator variables, where each variable is set to 1 if the hospital’s bed size falls into the relevant quartile. Provide a table of the average price among treated/control groups for each quartile.<br>
+```{r}
+library(dplyr)
+library(tidyr)
+
+# Step 1: Determine quartiles of bed size
+quartiles <- quantile(data_2012$beds, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Step 2: Create indicator variables for each quartile
+data_2012 <- data_2012 %>%
+  mutate(
+    quartile = case_when(
+      beds <= quartiles[2] ~ "Quartile 1",
+      beds > quartiles[2] & beds <= quartiles[3] ~ "Quartile 2",
+      beds > quartiles[3] & beds <= quartiles[4] ~ "Quartile 3",
+      beds > quartiles[4] ~ "Quartile 4"
+    ),
+    penalized = ifelse(hrrp_payment + hvbp_payment < 0, "Penalized", "Non-Penalized")
+  )
+
+# Step 3: Calculate the average price among treated and control groups for each quartile
+average_prices <- data_2012 %>%
+  group_by(quartile, penalized) %>%
+  summarise(
+    avg_price = mean(estimated_price, na.rm = TRUE)
+  ) %>%
+  pivot_wider(
+    names_from = penalized,
+    values_from = avg_price
+  )
+
+# Print the table of average prices among treated and control groups for each quartile
+print(average_prices)
+
+```
+\newpage
+\noindent 7. Find the average treatment effect using each of the following estimators, and present your results in a single table:
+
+Nearest neighbor matching (1-to-1) with inverse variance distance based on quartiles of bed size
+```{r, echo = FALSE}
+library(dplyr)
+library(cobalt)
+lp.vars <- data_2012 %>% 
+  dplyr::select(beds, mcaid_discharges, penalized, ip_charges, 
+         mcare_discharges, tot_mcare_payment, estimated_prices) %>%
+  filter(complete.cases(.))
+lp.covs <- lp.vars %>% select(-c("penalized","estimated_price"))
+
+m.nn.var <- Matching::Match(Y=lp.vars$estimated_prices,
+                            Tr=lp.vars$penalized,
+                            X=lp.covs,
+                            M=4,  
+                            Weight=1,
+                            estimand="ATE")
+
+var_estimate <- m.nn.var$estimates$ATE
+print(var_estimate)
+```
+
+Nearest neighbor matching (1-to-1) with Mahalanobis distance based on quartiles of bed size
+```{r, echo = FALSE}
+m.nn.md <- Matching::Match(Y=lp.vars$estimated_price,
+                           Tr=lp.vars$penalized,
+                           X=lp.covs,
+                           M=1,
+                           Weight=2,
+                           estimand="ATE")   
+
+md_estimate <- m.nn.md$estimates$ATE
+print(md_estimate)
+```
+
+Inverse propensity weighting, where the propensity scores are based on quartiles of bed size
+```{r, echo = FALSE}
+logit.model <- glm(penalized ~ beds + mcaid_discharges + ip_charges + mcare_discharges +
+            tot_mcare_payment, family=binomial, data=lp.vars)
+ps <- fitted(logit.model)
+m.nn.ps <- Matching::Match(Y=lp.vars$estimated_prices,
+                           Tr=lp.vars$penalized,
+                           X=ps,
+                           M=1,
+                           estimand="ATE")
+
+ps_estimate <- m.nn.ps$estimates$ATE
+print(ps_estimate)
+```
+
+Simple linear regression, adjusting for quartiles of bed size using dummy variables and appropriate interactions as discussed in class
+```{r, echo = FALSE}
+# Step 1: Prepare the dataset
+dataset <- data_2012 %>%
+  select(estimated_price, beds) %>%
+  filter(!is.na(estimated_price) & !is.na(beds))
+
+# Step 2: Create quartiles of bed size
+dataset <- dataset %>%
+  mutate(quartile = ntile(beds, 4))
+
+# Step 3: Create dummy variables for quartiles of bed size
+dataset <- dataset %>%
+  mutate(
+    quartile_1 = as.numeric(quartile == 1),
+    quartile_2 = as.numeric(quartile == 2),
+    quartile_3 = as.numeric(quartile == 3),
+    quartile_4 = as.numeric(quartile == 4)
+  )
+
+# Step 4: Fit the linear regression model
+model <- lm(estimated_price ~ beds + quartile_2 + quartile_3 + quartile_4 + beds:quartile_2 + beds:quartile_3 + beds:quartile_4, data = dataset)
+
+# Step 5: Interpret the results
+summary(model)
+print(var_estimate)
+print(md_estimate)
+print(ps_estimate)
+```
+
+\newpage
+# Summary Questions
+\vspace{.2in}
+\noindent 8. With these different treatment effect estimators, are the results similar, identical, very different?<br>
+
+My answers are very different based on different treatment effect estimators that I am using. 
+
+\newpage
+\noindent 9. Do you think you’ve estimated a causal effect of the penalty? Why or why not? (just a couple of sentences)<br>
+
+I think, if my codes were correct, I estimated a causal effect of the penalty because I separated penalty and non-penalty group like an experimental research. The only downside is that I do not know if the samples are randomly selected or not. This can result in biases.
+
+\newpage
+\noindent 10. Briefly describe your experience working with these data (just a few sentences). Tell me one thing you learned and one thing that really aggravated or surprised you.
+
+Just like homework 1, using these large dataset was not easy. I had to think about different variable names, and some mistake with these names cause errors while using these data. One thing surprising that the results were very different based on what treatment effect estimators that I was using. Since it is the first trial, I do not know if my work is correct, but that was the surprising part for my first trial. 
